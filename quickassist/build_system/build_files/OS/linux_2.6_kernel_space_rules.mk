@@ -79,7 +79,11 @@ else
 FLAG := KBUILD_BUILTIN=1
 endif
 
-OUTPUT_OBJECTS = $(patsubst %.c,%.o, $(SOURCES)) $(patsubst %.c,%.o, $(KLIBRARY_SOURCES))
+OUTPUT_OBJECTS = $(patsubst %.c,%.o, $(SOURCES)) $(patsubst %.c,%.o, $(KLIBRARY_SOURCES)) $(patsubst %.S,%.o, $(ASM_SOURCES))
+
+# modpost needs the per-object CRC records when these library members are
+# linked into a module. Keep their command files alongside the moved objects.
+OBJECT_COMMAND_FILES = $(foreach object,$(OUTPUT_OBJECTS),$(dir $(object)).$(notdir $(object)).cmd)
 
 $(LIB_STATIC): dirs
 	@echo 'Creating static library ${LIB_STATIC}'; \
@@ -87,6 +91,10 @@ $(LIB_STATIC): dirs
 	echo 'Copying outputs';\
 	test -f lib.a  &&  (ar -t lib.a | xargs ar -rcsD $(LIB_STATIC)); \
 	test -f $(LIB_STATIC)  &&  mv -f $(LIB_STATIC) $($(PROG_ACY)_FINAL_OUTPUT_DIR)/$(LIB_STATIC); \
+	for command_file in $(OBJECT_COMMAND_FILES); do \
+		sed '/^source_/s|:= \([^/]\)|:= $(PWD)/\1|' "$$command_file" \
+			> "$($(PROG_ACY)_FINAL_OUTPUT_DIR)/$${command_file##*/}" || exit $$?; \
+	done;\
 	mv -f $(OBJ) $($(PROG_ACY)_FINAL_OUTPUT_DIR);\
 	test -f built-in.o  &&  mv -f built-in.o $($(PROG_ACY)_FINAL_OUTPUT_DIR);\
 	test -f $(OUTPUT_NAME).ko  &&  mv -f $(OUTPUT_NAME).ko $($(PROG_ACY)_FINAL_OUTPUT_DIR);\

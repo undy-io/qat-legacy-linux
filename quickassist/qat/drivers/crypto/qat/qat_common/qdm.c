@@ -10,9 +10,12 @@
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/mutex.h>
+#include <linux/err.h>
 #include "qdm.h"
 
 static struct iommu_domain *domain;
+static DEFINE_MUTEX(qdm_domain_lock);
 
 static bool iommu_configured_passthrough(void)
 {
@@ -65,32 +68,62 @@ static inline int iommu_under_pt(void)
  */
 int qdm_attach_device(struct device *dev)
 {
-	if (!dev) {
-		pr_err("QAT: Invalid device\n");
-		return -ENODEV;
-	}
+        int ret;
 
-	if (!domain) {
-		if (iommu_under_pt()) {
-			dma_addr_t daddr;
-			void *paddr;
+        if (!dev) {
+                pr_err("QAT: Invalid device\n");
+                return -ENODEV;
+        }
 
-			/* To ensure the device is associated with the
-			 * default identity domain before any DMA requests
-			 * start when iommu works under PT mode in any case.
-			 **/
-			paddr = dma_alloc_coherent(dev,
-						   PAGE_SIZE,
-						   &daddr,
-						   GFP_KERNEL);
-			if (!paddr)
-				return -ENODEV;
-			dma_free_coherent(dev, PAGE_SIZE, paddr, daddr);
-		}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+        mutex_lock(&qdm_domain_lock);
 
-		return 0;
-	}
-	return iommu_attach_device(domain, dev);
+        if (!domain && qdm_iommu_present() && !iommu_under_pt()) {
+                struct iommu_domain *new_domain;
+
+                new_domain = iommu_paging_domain_alloc(dev);
+                if (IS_ERR(new_domain)) {
+                        ret = PTR_ERR(new_domain);
+                        pr_err("QAT: Failed to allocate IOMMU domain: %d\n",
+                               ret);
+                        mutex_unlock(&qdm_domain_lock);
+                        return ret;
+                }
+
+                domain = new_domain;
+        }
+#endif
+
+        if (!domain) {
+                if (iommu_under_pt()) {
+                        dma_addr_t daddr;
+                        void *paddr;
+
+                        paddr = dma_alloc_coherent(dev, PAGE_SIZE,
+                                                   &daddr, GFP_KERNEL);
+                        if (!paddr) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+                                mutex_unlock(&qdm_domain_lock);
+#endif
+                                return -ENODEV;
+                        }
+
+                        dma_free_coherent(dev, PAGE_SIZE, paddr, daddr);
+                }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+                mutex_unlock(&qdm_domain_lock);
+#endif
+                return 0;
+        }
+
+        ret = iommu_attach_device(domain, dev);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+        mutex_unlock(&qdm_domain_lock);
+#endif
+
+        return ret;
 }
 
 /**
@@ -199,19 +232,27 @@ EXPORT_SYMBOL_GPL(qdm_hugepage_iommu_map);
 
 int __init qdm_init(void)
 {
-	if (!qdm_iommu_present() || iommu_under_pt())
-		return 0;
+        if (!qdm_iommu_present() || iommu_under_pt())
+                return 0;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
-	domain = iommu_domain_alloc();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+        /*
+         * The IOMMU domain requires a device for allocation.
+         * Allocate lazily in qdm_attach_device().
+         */
+        return 0;
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
+        domain = iommu_domain_alloc();
 #else
-	domain = iommu_domain_alloc(&pci_bus_type);
+        domain = iommu_domain_alloc(&pci_bus_type);
 #endif
-	if (!domain) {
-		pr_err("QAT: Failed to allocate a domain\n");
-		return -1;
-	}
-	return 0;
+
+        if (!domain) {
+                pr_err("QAT: Failed to allocate a domain\n");
+                return -ENOMEM;
+        }
+
+        return 0;
 }
 
 void __exit qdm_exit(void)

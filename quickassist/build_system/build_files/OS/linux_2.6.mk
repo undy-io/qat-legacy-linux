@@ -69,6 +69,12 @@ INCLUDES+=-I./
 
 ifeq ($($(PROG_ACY)_OS_LEVEL), user_space)
 CFLAGS+=-fPIC $(DEBUGFLAGS) -Wall -Wpointer-arith $(INCLUDES)
+else
+# Recent Kbuild versions no longer consume EXTRA_CFLAGS. Keep the common
+# build system's include paths and feature defines in the supported variable.
+# Expand lazily: component Makefiles add flags after including this file.
+# Intermediate kernel libraries also end up in loadable modules.
+ccflags-y = $(EXTRA_CFLAGS) -DMODULE
 endif
 
 

@@ -41,7 +41,7 @@ struct adf_uio_control_accel {
 	unsigned int last_minor;
 	unsigned int num_ker_bundles;
 	/* bundle[] must be last to allow dynamic size allocation. */
-	struct adf_uio_control_bundle *bundle[0];
+	struct adf_uio_control_bundle *bundle[];
 };
 
 int adf_uio_sysfs_create(struct adf_accel_dev *accel_dev);

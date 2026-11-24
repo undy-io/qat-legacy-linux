@@ -177,10 +177,20 @@ LAC-kernel_module:lib_kernel
 
 obj-m := $(OUTPUT_NAME).o
 $(OUTPUT_NAME)-objs := $(patsubst %.c,%.o, $(MODULE_SOURCES))
+ifeq ($(ICP_OS_LEVEL),kernel_space)
+# List each prebuilt member so Kbuild's .mod file includes its CRC metadata.
+# Linking archives through ldflags-y hides those members from modpost.
+lib-kernel := qat_kernel/src/$(ICP_BUILD_OUTPUT_DIR)/libadf_kernel.a \
+	$(OSAL_PATH)/src/linux/kernel_space/$(ICP_BUILD_OUTPUT_DIR)/libosal.a \
+	$(ADDITIONAL_KERNEL_LIBS)
+lib-kernel := $(patsubst $(ICP_ROOT)/quickassist/%,../../../%,$(lib-kernel))
+$(OUTPUT_NAME)-objs += $(foreach library,$(lib-kernel),$(addprefix $(dir $(library)),$(shell $(AR) t $(library) 2>/dev/null)))
+else
 lib-kernel := $(ADDITIONAL_OBJECTS) $(ADDITIONAL_KERNEL_LIBS)
 static-lib-paths := $(patsubst %,-L$(LAC_DIR)/src/%, $(dir $(lib-kernel)))
 static-libs := $(patsubst %,-l:%, $(notdir $(lib-kernel)))
 ldflags-y += $(static-lib-paths) -whole-archive $(static-libs) -no-whole-archive
+endif
 
 lib_kernel::$(SUBDIRS)
 lib::$(SUBDIRS) $(LIB_STATIC)

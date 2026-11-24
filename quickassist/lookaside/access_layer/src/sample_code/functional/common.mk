@@ -167,6 +167,7 @@ else
 #
 ############################################################
 EXTRA_CFLAGS+=$(INCLUDES)
+ccflags-y = $(EXTRA_CFLAGS)
 KBUILD_EXTRA_SYMBOLS += $(SAMPLE_PATH)/../../Module.symvers
 export $(KBUILD_EXTRA_SYMBOLS)
 
