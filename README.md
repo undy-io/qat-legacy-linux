@@ -76,12 +76,13 @@ For the tested Ubuntu configuration, build dependencies include:
 
 ```sh
 sudo apt-get install build-essential pkg-config gawk pciutils nasm \
-  libboost-dev libudev-dev zlib1g-dev libssl-dev \
+  libboost-dev libudev-dev libnl-3-dev libnl-genl-3-dev zlib1g-dev libssl-dev \
   linux-headers-"$(uname -r)"
 ```
 
-QAT 1.8 configurations also need `libnl-3-dev` and `libnl-genl-3-dev`; consult
-the original [README](README) for the release's dependency and feature details.
+This release's configure script checks for both libnl development packages in
+non-Xen builds. Consult the original [README](README) for the release's other
+dependency and feature details.
 
 The configuration used on the validated host was:
 
