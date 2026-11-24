@@ -1,0 +1,229 @@
+--- a/quickassist/build_system/build_files/OS/linux_2.6.mk
++++ b/quickassist/build_system/build_files/OS/linux_2.6.mk
+@@ -69,6 +69,12 @@
+ 
+ ifeq ($($(PROG_ACY)_OS_LEVEL), user_space)
+ CFLAGS+=-fPIC $(DEBUGFLAGS) -Wall -Wpointer-arith $(INCLUDES)
++else
++# Recent Kbuild versions no longer consume EXTRA_CFLAGS. Keep the common
++# build system's include paths and feature defines in the supported variable.
++# Expand lazily: component Makefiles add flags after including this file.
++# Intermediate kernel libraries also end up in loadable modules.
++ccflags-y = $(EXTRA_CFLAGS) -DMODULE
+ endif
+ 
+ 
+--- a/quickassist/build_system/build_files/OS/linux_2.6_kernel_space_rules.mk
++++ b/quickassist/build_system/build_files/OS/linux_2.6_kernel_space_rules.mk
+@@ -79,7 +79,11 @@
+ FLAG := KBUILD_BUILTIN=1
+ endif
+ 
+-OUTPUT_OBJECTS = $(patsubst %.c,%.o, $(SOURCES)) $(patsubst %.c,%.o, $(KLIBRARY_SOURCES))
++OUTPUT_OBJECTS = $(patsubst %.c,%.o, $(SOURCES)) $(patsubst %.c,%.o, $(KLIBRARY_SOURCES)) $(patsubst %.S,%.o, $(ASM_SOURCES))
++
++# modpost needs the per-object CRC records when these library members are
++# linked into a module. Keep their command files alongside the moved objects.
++OBJECT_COMMAND_FILES = $(foreach object,$(OUTPUT_OBJECTS),$(dir $(object)).$(notdir $(object)).cmd)
+ 
+ $(LIB_STATIC): dirs
+ 	@echo 'Creating static library ${LIB_STATIC}'; \
+@@ -87,6 +91,10 @@
+ 	echo 'Copying outputs';\
+ 	test -f lib.a  &&  (ar -t lib.a | xargs ar -rcsD $(LIB_STATIC)); \
+ 	test -f $(LIB_STATIC)  &&  mv -f $(LIB_STATIC) $($(PROG_ACY)_FINAL_OUTPUT_DIR)/$(LIB_STATIC); \
++	for command_file in $(OBJECT_COMMAND_FILES); do \
++		sed '/^source_/s|:= \([^/]\)|:= $(PWD)/\1|' "$$command_file" \
++			> "$($(PROG_ACY)_FINAL_OUTPUT_DIR)/$${command_file##*/}" || exit $$?; \
++	done;\
+ 	mv -f $(OBJ) $($(PROG_ACY)_FINAL_OUTPUT_DIR);\
+ 	test -f built-in.o  &&  mv -f built-in.o $($(PROG_ACY)_FINAL_OUTPUT_DIR);\
+ 	test -f $(OUTPUT_NAME).ko  &&  mv -f $(OUTPUT_NAME).ko $($(PROG_ACY)_FINAL_OUTPUT_DIR);\
+--- a/quickassist/lookaside/access_layer/src/Makefile
++++ b/quickassist/lookaside/access_layer/src/Makefile
+@@ -177,10 +177,20 @@
+ 
+ obj-m := $(OUTPUT_NAME).o
+ $(OUTPUT_NAME)-objs := $(patsubst %.c,%.o, $(MODULE_SOURCES))
++ifeq ($(ICP_OS_LEVEL),kernel_space)
++# List each prebuilt member so Kbuild's .mod file includes its CRC metadata.
++# Linking archives through ldflags-y hides those members from modpost.
++lib-kernel := qat_kernel/src/$(ICP_BUILD_OUTPUT_DIR)/libadf_kernel.a \
++	$(OSAL_PATH)/src/linux/kernel_space/$(ICP_BUILD_OUTPUT_DIR)/libosal.a \
++	$(ADDITIONAL_KERNEL_LIBS)
++lib-kernel := $(patsubst $(ICP_ROOT)/quickassist/%,../../../%,$(lib-kernel))
++$(OUTPUT_NAME)-objs += $(foreach library,$(lib-kernel),$(addprefix $(dir $(library)),$(shell $(AR) t $(library) 2>/dev/null)))
++else
+ lib-kernel := $(ADDITIONAL_OBJECTS) $(ADDITIONAL_KERNEL_LIBS)
+ static-lib-paths := $(patsubst %,-L$(LAC_DIR)/src/%, $(dir $(lib-kernel)))
+ static-libs := $(patsubst %,-l:%, $(notdir $(lib-kernel)))
+ ldflags-y += $(static-lib-paths) -whole-archive $(static-libs) -no-whole-archive
++endif
+ 
+ lib_kernel::$(SUBDIRS)
+ lib::$(SUBDIRS) $(LIB_STATIC)
+--- a/quickassist/lookaside/access_layer/src/sample_code/functional/common.mk
++++ b/quickassist/lookaside/access_layer/src/sample_code/functional/common.mk
+@@ -167,6 +167,7 @@
+ #
+ ############################################################
+ EXTRA_CFLAGS+=$(INCLUDES)
++ccflags-y = $(EXTRA_CFLAGS)
+ KBUILD_EXTRA_SYMBOLS += $(SAMPLE_PATH)/../../Module.symvers
+ export $(KBUILD_EXTRA_SYMBOLS)
+ 
+--- a/quickassist/qat/drivers/crypto/qat/qat_common/adf_uio_control.h
++++ b/quickassist/qat/drivers/crypto/qat/qat_common/adf_uio_control.h
+@@ -41,7 +41,7 @@
+ 	unsigned int last_minor;
+ 	unsigned int num_ker_bundles;
+ 	/* bundle[] must be last to allow dynamic size allocation. */
+-	struct adf_uio_control_bundle *bundle[0];
++	struct adf_uio_control_bundle *bundle[];
+ };
+ 
+ int adf_uio_sysfs_create(struct adf_accel_dev *accel_dev);
+--- a/quickassist/qat/drivers/crypto/qat/qat_common/qdm.c
++++ b/quickassist/qat/drivers/crypto/qat/qat_common/qdm.c
+@@ -10,9 +10,12 @@
+ #include <linux/iommu.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
++#include <linux/mutex.h>
++#include <linux/err.h>
+ #include "qdm.h"
+ 
+ static struct iommu_domain *domain;
++static DEFINE_MUTEX(qdm_domain_lock);
+ 
+ static bool iommu_configured_passthrough(void)
+ {
+@@ -65,32 +68,62 @@
+  */
+ int qdm_attach_device(struct device *dev)
+ {
+-	if (!dev) {
+-		pr_err("QAT: Invalid device\n");
+-		return -ENODEV;
+-	}
+-
+-	if (!domain) {
+-		if (iommu_under_pt()) {
+-			dma_addr_t daddr;
+-			void *paddr;
+-
+-			/* To ensure the device is associated with the
+-			 * default identity domain before any DMA requests
+-			 * start when iommu works under PT mode in any case.
+-			 **/
+-			paddr = dma_alloc_coherent(dev,
+-						   PAGE_SIZE,
+-						   &daddr,
+-						   GFP_KERNEL);
+-			if (!paddr)
+-				return -ENODEV;
+-			dma_free_coherent(dev, PAGE_SIZE, paddr, daddr);
+-		}
+-
+-		return 0;
+-	}
+-	return iommu_attach_device(domain, dev);
++        int ret;
++
++        if (!dev) {
++                pr_err("QAT: Invalid device\n");
++                return -ENODEV;
++        }
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++        mutex_lock(&qdm_domain_lock);
++
++        if (!domain && qdm_iommu_present() && !iommu_under_pt()) {
++                struct iommu_domain *new_domain;
++
++                new_domain = iommu_paging_domain_alloc(dev);
++                if (IS_ERR(new_domain)) {
++                        ret = PTR_ERR(new_domain);
++                        pr_err("QAT: Failed to allocate IOMMU domain: %d\n",
++                               ret);
++                        mutex_unlock(&qdm_domain_lock);
++                        return ret;
++                }
++
++                domain = new_domain;
++        }
++#endif
++
++        if (!domain) {
++                if (iommu_under_pt()) {
++                        dma_addr_t daddr;
++                        void *paddr;
++
++                        paddr = dma_alloc_coherent(dev, PAGE_SIZE,
++                                                   &daddr, GFP_KERNEL);
++                        if (!paddr) {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++                                mutex_unlock(&qdm_domain_lock);
++#endif
++                                return -ENODEV;
++                        }
++
++                        dma_free_coherent(dev, PAGE_SIZE, paddr, daddr);
++                }
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++                mutex_unlock(&qdm_domain_lock);
++#endif
++                return 0;
++        }
++
++        ret = iommu_attach_device(domain, dev);
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++        mutex_unlock(&qdm_domain_lock);
++#endif
++
++        return ret;
+ }
+ 
+ /**
+@@ -199,19 +232,27 @@
+ 
+ int __init qdm_init(void)
+ {
+-	if (!qdm_iommu_present() || iommu_under_pt())
+-		return 0;
+-
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
+-	domain = iommu_domain_alloc();
++        if (!qdm_iommu_present() || iommu_under_pt())
++                return 0;
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++        /*
++         * The IOMMU domain requires a device for allocation.
++         * Allocate lazily in qdm_attach_device().
++         */
++        return 0;
++#elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
++        domain = iommu_domain_alloc();
+ #else
+-	domain = iommu_domain_alloc(&pci_bus_type);
+-#endif
+-	if (!domain) {
+-		pr_err("QAT: Failed to allocate a domain\n");
+-		return -1;
+-	}
+-	return 0;
++        domain = iommu_domain_alloc(&pci_bus_type);
++#endif
++
++        if (!domain) {
++                pr_err("QAT: Failed to allocate a domain\n");
++                return -ENOMEM;
++        }
++
++        return 0;
+ }
+ 
+ void __exit qdm_exit(void)
